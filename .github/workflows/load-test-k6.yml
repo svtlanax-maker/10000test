@@ -27,6 +27,7 @@ jobs:
 
     env:
       PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/backend
       TARGET_MODE: ${{ github.event.inputs.target_mode }}
       INPUT_BASE_URL: ${{ github.event.inputs.base_url }}
       K6_VUS: ${{ github.event.inputs.vus }}
@@ -60,25 +61,35 @@ jobs:
 
       - name: Install k6
         run: |
-          sudo gpg -k
           sudo apt-get update
           sudo apt-get install -y gnupg ca-certificates
           curl -fsSL https://dl.k6.io/key.gpg \
             | sudo gpg --dearmor -o /usr/share/keyrings/k6-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] \
-          https://dl.k6.io/deb stable main" \
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
             | sudo tee /etc/apt/sources.list.d/k6.list
           sudo apt-get update
           sudo apt-get install -y k6
 
+      - name: Startup smoke import
+        if: ${{ env.TARGET_MODE == 'local' }}
+        run: |
+          python - <<'PY'
+          import importlib
+          mod = importlib.import_module("app.main")
+          assert hasattr(mod, "app"), "app.main must export FastAPI app"
+          print("Startup smoke import OK")
+          PY
+
       - name: Start backend locally
         if: ${{ env.TARGET_MODE == 'local' }}
         run: |
-          nohup python -m uvicorn backend.app.main:app \
+          nohup python -m uvicorn app.main:app \
+            --app-dir backend \
             --host 127.0.0.1 \
             --port 8000 \
             > backend_logs/backend.log 2>&1 &
           echo $! > backend_logs/backend.pid
+          sleep 3
 
       - name: Wait for local backend health
         if: ${{ env.TARGET_MODE == 'local' }}
@@ -89,11 +100,11 @@ jobs:
           import urllib.request
 
           url = "http://127.0.0.1:8000/health"
-          deadline = time.time() + 90
+          deadline = time.time() + 120
 
           while time.time() < deadline:
               try:
-                  with urllib.request.urlopen(url, timeout=3) as resp:
+                  with urllib.request.urlopen(url, timeout=5) as resp:
                       if resp.status == 200:
                           print("Backend is ready")
                           sys.exit(0)
@@ -104,6 +115,18 @@ jobs:
           print("Backend did not become ready in time", file=sys.stderr)
           sys.exit(1)
           PY
+
+      - name: Print backend log on failure
+        if: ${{ failure() && env.TARGET_MODE == 'local' }}
+        run: |
+          echo "===== backend.log (tail 200) ====="
+          if [ -f backend_logs/backend.log ]; then
+            tail -n 200 backend_logs/backend.log
+            tail -n 200 backend_logs/backend.log > load_artifacts/backend_tail.txt
+            cp backend_logs/backend.log load_artifacts/backend.log
+          else
+            echo "backend_logs/backend.log not found"
+          fi
 
       - name: Resolve BASE_URL
         run: |
@@ -156,6 +179,7 @@ jobs:
         run: |
           if [ -f backend_logs/backend.log ]; then
             cp backend_logs/backend.log load_artifacts/backend.log
+            tail -n 200 backend_logs/backend.log > load_artifacts/backend_tail.txt
           fi
 
       - name: Upload load artifacts
