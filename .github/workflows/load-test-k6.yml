@@ -1,0 +1,167 @@
+name: Load Test K6
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_mode:
+        description: "local | external"
+        required: true
+        default: "local"
+      base_url:
+        description: "External BASE_URL when target_mode=external"
+        required: false
+        default: ""
+      vus:
+        description: "Peak virtual users"
+        required: true
+        default: "10000"
+      duration:
+        description: "Test duration, e.g. 30s, 1m, 5m"
+        required: true
+        default: "30s"
+
+jobs:
+  load-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      TARGET_MODE: ${{ github.event.inputs.target_mode }}
+      INPUT_BASE_URL: ${{ github.event.inputs.base_url }}
+      K6_VUS: ${{ github.event.inputs.vus }}
+      K6_DURATION: ${{ github.event.inputs.duration }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create artifact dirs
+        run: |
+          mkdir -p load_artifacts
+          mkdir -p backend_logs
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f backend/requirements.txt ]; then
+            pip install -r backend/requirements.txt
+          fi
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo apt-get update
+          sudo apt-get install -y gnupg ca-certificates
+          curl -fsSL https://dl.k6.io/key.gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/k6-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] \
+          https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install -y k6
+
+      - name: Start backend locally
+        if: ${{ env.TARGET_MODE == 'local' }}
+        run: |
+          nohup python -m uvicorn backend.app.main:app \
+            --host 127.0.0.1 \
+            --port 8000 \
+            > backend_logs/backend.log 2>&1 &
+          echo $! > backend_logs/backend.pid
+
+      - name: Wait for local backend health
+        if: ${{ env.TARGET_MODE == 'local' }}
+        run: |
+          python - <<'PY'
+          import sys
+          import time
+          import urllib.request
+
+          url = "http://127.0.0.1:8000/health"
+          deadline = time.time() + 90
+
+          while time.time() < deadline:
+              try:
+                  with urllib.request.urlopen(url, timeout=3) as resp:
+                      if resp.status == 200:
+                          print("Backend is ready")
+                          sys.exit(0)
+              except Exception:
+                  pass
+              time.sleep(2)
+
+          print("Backend did not become ready in time", file=sys.stderr)
+          sys.exit(1)
+          PY
+
+      - name: Resolve BASE_URL
+        run: |
+          if [ "${TARGET_MODE}" = "local" ]; then
+            echo "BASE_URL=http://127.0.0.1:8000" >> "$GITHUB_ENV"
+          else
+            if [ -z "${INPUT_BASE_URL}" ]; then
+              echo "External mode requires base_url input" >&2
+              exit 1
+            fi
+            echo "BASE_URL=${INPUT_BASE_URL}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Save meta
+        run: |
+          {
+            echo "target_mode=${TARGET_MODE}"
+            echo "base_url=${BASE_URL}"
+            echo "vus=${K6_VUS}"
+            echo "duration=${K6_DURATION}"
+            echo "workflow=${GITHUB_WORKFLOW}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "sha=${GITHUB_SHA}"
+          } > load_artifacts/load_meta.txt
+
+      - name: Run k6 load test
+        run: |
+          k6 run \
+            --vus "${K6_VUS}" \
+            --duration "${K6_DURATION}" \
+            --summary-export load_artifacts/k6_summary.json \
+            -e BASE_URL="${BASE_URL}" \
+            tests/load/k6-scenarios/concurrent_10k_health.js \
+            | tee load_artifacts/k6_output.txt
+
+      - name: Save process info
+        if: always()
+        run: |
+          ps aux > load_artifacts/ps_aux.txt
+
+      - name: Stop local backend
+        if: ${{ always() && env.TARGET_MODE == 'local' }}
+        run: |
+          if [ -f backend_logs/backend.pid ]; then
+            kill "$(cat backend_logs/backend.pid)" || true
+          fi
+
+      - name: Collect local backend log
+        if: ${{ always() && env.TARGET_MODE == 'local' }}
+        run: |
+          if [ -f backend_logs/backend.log ]; then
+            cp backend_logs/backend.log load_artifacts/backend.log
+          fi
+
+      - name: Upload load artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-k6-artifacts
+          path: load_artifacts/
+          if-no-files-found: warn
