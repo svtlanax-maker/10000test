@@ -1,4 +1,4 @@
-name: Load Test K6
+name: load-test-k6
 
 on:
   workflow_dispatch:
@@ -20,75 +20,154 @@ on:
         required: true
         default: "30s"
 
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
 jobs:
   load-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: efhc_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d efhc_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
 
     env:
+      DB_SCHEMA_CORE: efhc_core
+      DB_SCHEMA_ADMIN: efhc_admin
+
+      DATABASE_URL: >-
+        postgresql+psycopg://postgres:postgres@localhost:5432/efhc_test
+      SYNC_DATABASE_URL: >-
+        postgresql+psycopg://postgres:postgres@localhost:5432/efhc_test
+      ASYNC_DATABASE_URL: >-
+        postgresql+asyncpg://postgres:postgres@localhost:5432/efhc_test
+
+      PSYCOPG_URL: postgresql://postgres:postgres@localhost:5432/efhc_test
+
       PYTHONUNBUFFERED: "1"
-      PYTHONPATH: ${{ github.workspace }}/backend
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_PYTHON_VERSION_WARNING: "1"
+
       TARGET_MODE: ${{ github.event.inputs.target_mode }}
       INPUT_BASE_URL: ${{ github.event.inputs.base_url }}
       K6_VUS: ${{ github.event.inputs.vus }}
       K6_DURATION: ${{ github.event.inputs.duration }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Create artifact dirs
+      - name: Init artifacts
         run: |
-          mkdir -p load_artifacts
-          mkdir -p backend_logs
+          rm -rf ci_artifacts extracted
+          mkdir -p ci_artifacts
+          mkdir -p ci_artifacts/load_artifacts
+          mkdir -p ci_artifacts/backend_logs
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install backend dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f backend/requirements.txt ]; then
-            pip install -r backend/requirements.txt
-          fi
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: "20"
+
+      - name: Versions
+        run: |
+          {
+            echo "ref=$GITHUB_REF"
+            echo "sha=$GITHUB_SHA"
+            python -V
+            python -m pip -V
+            node -v
+            npm -v
+          } | tee ci_artifacts/01_versions.txt
+
+      - name: Ensure efhc.zip
+        run: |
+          test -f efhc.zip || \
+            (echo "ERROR: efhc.zip missing" && exit 1)
+          ls -la efhc.zip | tee ci_artifacts/02_efhc_zip_ls.txt
+
+      - name: Unzip efhc.zip
+        run: |
+          mkdir -p extracted
+          unzip -q efhc.zip -d extracted
+          find extracted -maxdepth 12 -name ".npmrc" \
+            -print -delete || true
+          test -d extracted/backend || \
+            (echo "ERROR: extracted/backend missing" && exit 1)
+          test -f extracted/backend/alembic.ini || exit 1
+          test -f extracted/backend/requirements.txt || exit 1
+
+      - name: Install backend deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r extracted/backend/requirements.txt
+          pip install "psycopg[binary]" alembic PyJWT
+          pip freeze | sort | tee ci_artifacts/03_pip_freeze.txt
 
       - name: Install k6
         run: |
           sudo apt-get update
           sudo apt-get install -y gnupg ca-certificates
           curl -fsSL https://dl.k6.io/key.gpg \
-            | sudo gpg --dearmor -o /usr/share/keyrings/k6-archive-keyring.gpg
+            | sudo gpg --dearmor \
+                -o /usr/share/keyrings/k6-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
             | sudo tee /etc/apt/sources.list.d/k6.list
           sudo apt-get update
           sudo apt-get install -y k6
+          k6 version | tee ci_artifacts/04_k6_version.txt
+
+      - name: Install psql client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+          psql --version | tee ci_artifacts/05_psql_version.txt
+
+      - name: Alembic upgrade head
+        if: ${{ env.TARGET_MODE == 'local' }}
+        run: |
+          cd extracted/backend
+          python -m alembic -c alembic.ini upgrade head \
+            2>&1 | tee ../../ci_artifacts/06_alembic_upgrade.txt
 
       - name: Startup smoke import
         if: ${{ env.TARGET_MODE == 'local' }}
         run: |
-          python - <<'PY'
+          cd extracted
+          PYTHONPATH=backend python - <<'PY' \
+            2>&1 | tee ../ci_artifacts/07_startup_smoke.txt
           import importlib
           mod = importlib.import_module("app.main")
-          assert hasattr(mod, "app"), "app.main must export FastAPI app"
+          assert hasattr(mod, "app"), \
+              "app.main must export FastAPI app"
           print("Startup smoke import OK")
           PY
 
       - name: Start backend locally
         if: ${{ env.TARGET_MODE == 'local' }}
         run: |
-          nohup python -m uvicorn app.main:app \
-            --app-dir backend \
+          cd extracted
+          nohup env PYTHONPATH=backend \
+            python -m uvicorn app.main:app \
             --host 127.0.0.1 \
             --port 8000 \
-            > backend_logs/backend.log 2>&1 &
-          echo $! > backend_logs/backend.pid
+            > ../ci_artifacts/backend_logs/backend.log 2>&1 &
+          echo $! > ../ci_artifacts/backend_logs/backend.pid
           sleep 3
 
       - name: Wait for local backend health
@@ -120,12 +199,14 @@ jobs:
         if: ${{ failure() && env.TARGET_MODE == 'local' }}
         run: |
           echo "===== backend.log (tail 200) ====="
-          if [ -f backend_logs/backend.log ]; then
-            tail -n 200 backend_logs/backend.log
-            tail -n 200 backend_logs/backend.log > load_artifacts/backend_tail.txt
-            cp backend_logs/backend.log load_artifacts/backend.log
+          if [ -f ci_artifacts/backend_logs/backend.log ]; then
+            tail -n 200 ci_artifacts/backend_logs/backend.log
+            tail -n 200 ci_artifacts/backend_logs/backend.log \
+              > ci_artifacts/load_artifacts/backend_tail.txt
+            cp ci_artifacts/backend_logs/backend.log \
+              ci_artifacts/load_artifacts/backend.log
           else
-            echo "backend_logs/backend.log not found"
+            echo "backend log not found"
           fi
 
       - name: Resolve BASE_URL
@@ -134,7 +215,7 @@ jobs:
             echo "BASE_URL=http://127.0.0.1:8000" >> "$GITHUB_ENV"
           else
             if [ -z "${INPUT_BASE_URL}" ]; then
-              echo "External mode requires base_url input" >&2
+              echo "ERROR: external mode requires base_url" >&2
               exit 1
             fi
             echo "BASE_URL=${INPUT_BASE_URL}" >> "$GITHUB_ENV"
@@ -150,36 +231,40 @@ jobs:
             echo "workflow=${GITHUB_WORKFLOW}"
             echo "run_id=${GITHUB_RUN_ID}"
             echo "sha=${GITHUB_SHA}"
-          } > load_artifacts/load_meta.txt
+          } > ci_artifacts/load_artifacts/load_meta.txt
 
       - name: Run k6 load test
         run: |
+          cd extracted
           k6 run \
             --vus "${K6_VUS}" \
             --duration "${K6_DURATION}" \
-            --summary-export load_artifacts/k6_summary.json \
+            --summary-export \
+              ../ci_artifacts/load_artifacts/k6_summary.json \
             -e BASE_URL="${BASE_URL}" \
             tests/load/k6-scenarios/concurrent_10k_health.js \
-            | tee load_artifacts/k6_output.txt
+            | tee ../ci_artifacts/load_artifacts/k6_output.txt
 
       - name: Save process info
         if: always()
         run: |
-          ps aux > load_artifacts/ps_aux.txt
+          ps aux > ci_artifacts/load_artifacts/ps_aux.txt
 
       - name: Stop local backend
         if: ${{ always() && env.TARGET_MODE == 'local' }}
         run: |
-          if [ -f backend_logs/backend.pid ]; then
-            kill "$(cat backend_logs/backend.pid)" || true
+          if [ -f ci_artifacts/backend_logs/backend.pid ]; then
+            kill "$(cat ci_artifacts/backend_logs/backend.pid)" || true
           fi
 
-      - name: Collect local backend log
+      - name: Collect backend log
         if: ${{ always() && env.TARGET_MODE == 'local' }}
         run: |
-          if [ -f backend_logs/backend.log ]; then
-            cp backend_logs/backend.log load_artifacts/backend.log
-            tail -n 200 backend_logs/backend.log > load_artifacts/backend_tail.txt
+          if [ -f ci_artifacts/backend_logs/backend.log ]; then
+            cp ci_artifacts/backend_logs/backend.log \
+              ci_artifacts/load_artifacts/backend.log
+            tail -n 200 ci_artifacts/backend_logs/backend.log \
+              > ci_artifacts/load_artifacts/backend_tail.txt
           fi
 
       - name: Upload load artifacts
@@ -187,5 +272,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: load-test-k6-artifacts
-          path: load_artifacts/
+          path: ci_artifacts/load_artifacts/
           if-no-files-found: warn
