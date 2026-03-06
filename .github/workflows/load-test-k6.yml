@@ -1,4 +1,4 @@
-name: runtime-diagnostic-k6-soft
+name: runtime-diagnostic-k6-plus
 
 on:
   workflow_dispatch:
@@ -14,15 +14,15 @@ on:
       vus:
         description: "Peak virtual users"
         required: true
-        default: "300"
+        default: "1000"
       duration:
-        description: "Test duration, e.g. 30s, 1m, 5m"
+        description: "Test duration, e.g. 45s, 1m, 2m"
         required: true
-        default: "45s"
+        default: "60s"
       think_ms:
         description: "Delay between requests in milliseconds"
         required: true
-        default: "300"
+        default: "200"
 
 defaults:
   run:
@@ -123,7 +123,7 @@ jobs:
       - name: Install k6
         run: |
           sudo apt-get update
-          sudo apt-get install -y gnupg ca-certificates
+          sudo apt-get install -y gnupg ca-certificates curl
           curl -fsSL https://dl.k6.io/key.gpg \
             | sudo gpg --dearmor \
               -o /usr/share/keyrings/k6-archive-keyring.gpg
@@ -133,10 +133,10 @@ jobs:
           sudo apt-get install -y k6
           k6 version | tee ci_artifacts/04_k6_version.txt
 
-      - name: Install psql client
+      - name: Install diagnostics tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y postgresql-client
+          sudo apt-get install -y postgresql-client lsof net-tools
           psql --version | tee ci_artifacts/05_psql_version.txt
 
       - name: Alembic upgrade head
@@ -153,9 +153,9 @@ jobs:
           PYTHONPATH=backend python - <<'PY' \
             2>&1 | tee ../ci_artifacts/07_startup_smoke.txt
           import importlib
-          mod = importlib.import_module('app.main')
-          assert hasattr(mod, 'app'), 'app.main must export FastAPI app'
-          print('Startup smoke import OK')
+          mod = importlib.import_module("app.main")
+          assert hasattr(mod, "app"), "app.main must export FastAPI app"
+          print("Startup smoke import OK")
           PY
 
       - name: Start backend locally
@@ -168,7 +168,7 @@ jobs:
             --port 8000 \
             > ../ci_artifacts/backend_logs/backend.log 2>&1 &
           echo $! > ../ci_artifacts/backend_logs/backend.pid
-          sleep 3
+          sleep 5
 
       - name: Wait for local backend health
         if: ${{ env.TARGET_MODE == 'local' }}
@@ -178,44 +178,30 @@ jobs:
           import time
           import urllib.request
 
-          url = 'http://127.0.0.1:8000/health'
+          url = "http://127.0.0.1:8000/health"
           deadline = time.time() + 120
 
           while time.time() < deadline:
               try:
                   with urllib.request.urlopen(url, timeout=5) as resp:
                       if resp.status == 200:
-                          print('Backend is ready')
+                          print("Backend is ready")
                           sys.exit(0)
               except Exception:
                   pass
               time.sleep(2)
 
-          print('Backend did not become ready in time', file=sys.stderr)
+          print("Backend did not become ready in time", file=sys.stderr)
           sys.exit(1)
           PY
-
-      - name: Print backend log on failure
-        if: ${{ failure() && env.TARGET_MODE == 'local' }}
-        run: |
-          echo '===== backend.log (tail 200) ====='
-          if [ -f ci_artifacts/backend_logs/backend.log ]; then
-            tail -n 200 ci_artifacts/backend_logs/backend.log
-            tail -n 200 ci_artifacts/backend_logs/backend.log \
-              > ci_artifacts/runtime_artifacts/backend_tail.txt
-            cp ci_artifacts/backend_logs/backend.log \
-              ci_artifacts/runtime_artifacts/backend.log
-          else
-            echo 'backend log not found'
-          fi
 
       - name: Resolve BASE_URL
         run: |
           if [ "${TARGET_MODE}" = "local" ]; then
-            echo 'BASE_URL=http://127.0.0.1:8000' >> "$GITHUB_ENV"
+            echo "BASE_URL=http://127.0.0.1:8000" >> "$GITHUB_ENV"
           else
             if [ -z "${INPUT_BASE_URL}" ]; then
-              echo 'ERROR: external mode requires base_url' >&2
+              echo "ERROR: external mode requires base_url" >&2
               exit 1
             fi
             echo "BASE_URL=${INPUT_BASE_URL}" >> "$GITHUB_ENV"
@@ -234,6 +220,20 @@ jobs:
             echo "sha=${GITHUB_SHA}"
           } > ci_artifacts/runtime_artifacts/load_meta.txt
 
+      - name: Pre-run probes
+        if: ${{ env.TARGET_MODE == 'local' }}
+        run: |
+          {
+            echo "=== /health ==="
+            curl -sS -i http://127.0.0.1:8000/health || true
+            echo
+            echo "=== /openapi.json ==="
+            curl -sS -i http://127.0.0.1:8000/openapi.json || true
+            echo
+            echo "=== /docs ==="
+            curl -sS -i http://127.0.0.1:8000/docs || true
+          } > ci_artifacts/runtime_artifacts/pre_run_probes.txt
+
       - name: Run k6 runtime diagnostic
         run: |
           cd extracted
@@ -247,10 +247,38 @@ jobs:
             tests/load/k6-scenarios/runtime_diag_soft.js \
             | tee ../ci_artifacts/runtime_artifacts/k6_output.txt
 
-      - name: Save process info
+      - name: Post-run probes
         if: always()
         run: |
-          ps aux > ci_artifacts/runtime_artifacts/ps_aux.txt
+          {
+            echo "=== /health ==="
+            curl -sS -i http://127.0.0.1:8000/health || true
+            echo
+            echo "=== /openapi.json ==="
+            curl -sS -i http://127.0.0.1:8000/openapi.json || true
+            echo
+            echo "=== /docs ==="
+            curl -sS -i http://127.0.0.1:8000/docs || true
+          } > ci_artifacts/runtime_artifacts/post_run_probes.txt
+
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          ps aux > ci_artifacts/runtime_artifacts/ps_aux.txt || true
+          ss -ltnp > ci_artifacts/runtime_artifacts/ss_ltnp.txt || true
+          lsof -i -P -n > ci_artifacts/runtime_artifacts/lsof_i.txt || true
+          free -m > ci_artifacts/runtime_artifacts/free_m.txt || true
+          df -h > ci_artifacts/runtime_artifacts/df_h.txt || true
+
+      - name: Print backend log on failure
+        if: ${{ failure() && env.TARGET_MODE == 'local' }}
+        run: |
+          echo "===== backend.log (tail 300) ====="
+          if [ -f ci_artifacts/backend_logs/backend.log ]; then
+            tail -n 300 ci_artifacts/backend_logs/backend.log
+          else
+            echo "backend log not found"
+          fi
 
       - name: Stop local backend
         if: ${{ always() && env.TARGET_MODE == 'local' }}
@@ -265,7 +293,7 @@ jobs:
           if [ -f ci_artifacts/backend_logs/backend.log ]; then
             cp ci_artifacts/backend_logs/backend.log \
               ci_artifacts/runtime_artifacts/backend.log
-            tail -n 200 ci_artifacts/backend_logs/backend.log \
+            tail -n 300 ci_artifacts/backend_logs/backend.log \
               > ci_artifacts/runtime_artifacts/backend_tail.txt
           fi
 
@@ -273,6 +301,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: runtime-diagnostic-k6-soft-artifacts
+          name: runtime-diagnostic-k6-plus-artifacts
           path: ci_artifacts/runtime_artifacts/
           if-no-files-found: warn
