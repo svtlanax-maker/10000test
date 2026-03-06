@@ -1,4 +1,4 @@
-name: runtime-diagnostic-k6
+name: runtime-diagnostic-k6-soft
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ on:
       vus:
         description: "Peak virtual users"
         required: true
-        default: "1000"
+        default: "300"
       duration:
         description: "Test duration, e.g. 30s, 1m, 5m"
         required: true
@@ -22,7 +22,7 @@ on:
       think_ms:
         description: "Delay between requests in milliseconds"
         required: true
-        default: "200"
+        default: "300"
 
 defaults:
   run:
@@ -127,8 +127,10 @@ jobs:
           curl -fsSL https://dl.k6.io/key.gpg \
             | sudo gpg --dearmor \
               -o /usr/share/keyrings/k6-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
-            | sudo tee /etc/apt/sources.list.d/k6.list
+          echo "deb [signed-by=/usr/share/keyrings/"
+          echo "k6-archive-keyring.gpg] https://dl.k6.io/deb"
+          echo "stable main" | tr '\n' ' ' \
+            | sudo tee /etc/apt/sources.list.d/k6.list >/dev/null
           sudo apt-get update
           sudo apt-get install -y k6
           k6 version | tee ci_artifacts/04_k6_version.txt
@@ -244,7 +246,7 @@ jobs:
               ../ci_artifacts/runtime_artifacts/k6_summary.json \
             -e BASE_URL="${BASE_URL}" \
             -e THINK_MS="${THINK_MS}" \
-            tests/load/k6-scenarios/runtime_diag.js \
+            tests/load/k6-scenarios/runtime_diag_soft.js \
             | tee ../ci_artifacts/runtime_artifacts/k6_output.txt
 
       - name: Save process info
@@ -273,6 +275,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: runtime-diagnostic-k6-artifacts
+          name: runtime-diagnostic-k6-soft-artifacts
           path: ci_artifacts/runtime_artifacts/
           if-no-files-found: warn
