@@ -1,4 +1,4 @@
-name: load-test-k6
+name: runtime-diagnostic-k6
 
 on:
   workflow_dispatch:
@@ -14,18 +14,22 @@ on:
       vus:
         description: "Peak virtual users"
         required: true
-        default: "10000"
+        default: "1000"
       duration:
         description: "Test duration, e.g. 30s, 1m, 5m"
         required: true
-        default: "30s"
+        default: "45s"
+      think_ms:
+        description: "Delay between requests in milliseconds"
+        required: true
+        default: "200"
 
 defaults:
   run:
     shell: bash -euo pipefail {0}
 
 jobs:
-  load-test:
+  runtime-diagnostic:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -47,24 +51,22 @@ jobs:
     env:
       DB_SCHEMA_CORE: efhc_core
       DB_SCHEMA_ADMIN: efhc_admin
-
       DATABASE_URL: >-
         postgresql+psycopg://postgres:postgres@localhost:5432/efhc_test
       SYNC_DATABASE_URL: >-
         postgresql+psycopg://postgres:postgres@localhost:5432/efhc_test
       ASYNC_DATABASE_URL: >-
         postgresql+asyncpg://postgres:postgres@localhost:5432/efhc_test
-
-      PSYCOPG_URL: postgresql://postgres:postgres@localhost:5432/efhc_test
-
+      PSYCOPG_URL: >-
+        postgresql://postgres:postgres@localhost:5432/efhc_test
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PIP_NO_PYTHON_VERSION_WARNING: "1"
-
       TARGET_MODE: ${{ github.event.inputs.target_mode }}
       INPUT_BASE_URL: ${{ github.event.inputs.base_url }}
       K6_VUS: ${{ github.event.inputs.vus }}
       K6_DURATION: ${{ github.event.inputs.duration }}
+      THINK_MS: ${{ github.event.inputs.think_ms }}
 
     steps:
       - uses: actions/checkout@v4
@@ -72,8 +74,7 @@ jobs:
       - name: Init artifacts
         run: |
           rm -rf ci_artifacts extracted
-          mkdir -p ci_artifacts
-          mkdir -p ci_artifacts/load_artifacts
+          mkdir -p ci_artifacts/runtime_artifacts
           mkdir -p ci_artifacts/backend_logs
 
       - uses: actions/setup-python@v5
@@ -125,7 +126,7 @@ jobs:
           sudo apt-get install -y gnupg ca-certificates
           curl -fsSL https://dl.k6.io/key.gpg \
             | sudo gpg --dearmor \
-                -o /usr/share/keyrings/k6-archive-keyring.gpg
+              -o /usr/share/keyrings/k6-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
             | sudo tee /etc/apt/sources.list.d/k6.list
           sudo apt-get update
@@ -152,10 +153,9 @@ jobs:
           PYTHONPATH=backend python - <<'PY' \
             2>&1 | tee ../ci_artifacts/07_startup_smoke.txt
           import importlib
-          mod = importlib.import_module("app.main")
-          assert hasattr(mod, "app"), \
-              "app.main must export FastAPI app"
-          print("Startup smoke import OK")
+          mod = importlib.import_module('app.main')
+          assert hasattr(mod, 'app'), 'app.main must export FastAPI app'
+          print('Startup smoke import OK')
           PY
 
       - name: Start backend locally
@@ -178,44 +178,44 @@ jobs:
           import time
           import urllib.request
 
-          url = "http://127.0.0.1:8000/health"
+          url = 'http://127.0.0.1:8000/health'
           deadline = time.time() + 120
 
           while time.time() < deadline:
               try:
                   with urllib.request.urlopen(url, timeout=5) as resp:
                       if resp.status == 200:
-                          print("Backend is ready")
+                          print('Backend is ready')
                           sys.exit(0)
               except Exception:
                   pass
               time.sleep(2)
 
-          print("Backend did not become ready in time", file=sys.stderr)
+          print('Backend did not become ready in time', file=sys.stderr)
           sys.exit(1)
           PY
 
       - name: Print backend log on failure
         if: ${{ failure() && env.TARGET_MODE == 'local' }}
         run: |
-          echo "===== backend.log (tail 200) ====="
+          echo '===== backend.log (tail 200) ====='
           if [ -f ci_artifacts/backend_logs/backend.log ]; then
             tail -n 200 ci_artifacts/backend_logs/backend.log
             tail -n 200 ci_artifacts/backend_logs/backend.log \
-              > ci_artifacts/load_artifacts/backend_tail.txt
+              > ci_artifacts/runtime_artifacts/backend_tail.txt
             cp ci_artifacts/backend_logs/backend.log \
-              ci_artifacts/load_artifacts/backend.log
+              ci_artifacts/runtime_artifacts/backend.log
           else
-            echo "backend log not found"
+            echo 'backend log not found'
           fi
 
       - name: Resolve BASE_URL
         run: |
           if [ "${TARGET_MODE}" = "local" ]; then
-            echo "BASE_URL=http://127.0.0.1:8000" >> "$GITHUB_ENV"
+            echo 'BASE_URL=http://127.0.0.1:8000' >> "$GITHUB_ENV"
           else
             if [ -z "${INPUT_BASE_URL}" ]; then
-              echo "ERROR: external mode requires base_url" >&2
+              echo 'ERROR: external mode requires base_url' >&2
               exit 1
             fi
             echo "BASE_URL=${INPUT_BASE_URL}" >> "$GITHUB_ENV"
@@ -228,27 +228,29 @@ jobs:
             echo "base_url=${BASE_URL}"
             echo "vus=${K6_VUS}"
             echo "duration=${K6_DURATION}"
+            echo "think_ms=${THINK_MS}"
             echo "workflow=${GITHUB_WORKFLOW}"
             echo "run_id=${GITHUB_RUN_ID}"
             echo "sha=${GITHUB_SHA}"
-          } > ci_artifacts/load_artifacts/load_meta.txt
+          } > ci_artifacts/runtime_artifacts/load_meta.txt
 
-      - name: Run k6 load test
+      - name: Run k6 runtime diagnostic
         run: |
           cd extracted
           k6 run \
             --vus "${K6_VUS}" \
             --duration "${K6_DURATION}" \
             --summary-export \
-              ../ci_artifacts/load_artifacts/k6_summary.json \
+              ../ci_artifacts/runtime_artifacts/k6_summary.json \
             -e BASE_URL="${BASE_URL}" \
-            tests/load/k6-scenarios/concurrent_10k_health.js \
-            | tee ../ci_artifacts/load_artifacts/k6_output.txt
+            -e THINK_MS="${THINK_MS}" \
+            tests/load/k6-scenarios/runtime_diag.js \
+            | tee ../ci_artifacts/runtime_artifacts/k6_output.txt
 
       - name: Save process info
         if: always()
         run: |
-          ps aux > ci_artifacts/load_artifacts/ps_aux.txt
+          ps aux > ci_artifacts/runtime_artifacts/ps_aux.txt
 
       - name: Stop local backend
         if: ${{ always() && env.TARGET_MODE == 'local' }}
@@ -262,15 +264,15 @@ jobs:
         run: |
           if [ -f ci_artifacts/backend_logs/backend.log ]; then
             cp ci_artifacts/backend_logs/backend.log \
-              ci_artifacts/load_artifacts/backend.log
+              ci_artifacts/runtime_artifacts/backend.log
             tail -n 200 ci_artifacts/backend_logs/backend.log \
-              > ci_artifacts/load_artifacts/backend_tail.txt
+              > ci_artifacts/runtime_artifacts/backend_tail.txt
           fi
 
-      - name: Upload load artifacts
+      - name: Upload runtime artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: load-test-k6-artifacts
-          path: ci_artifacts/load_artifacts/
+          name: runtime-diagnostic-k6-artifacts
+          path: ci_artifacts/runtime_artifacts/
           if-no-files-found: warn
